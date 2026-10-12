@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include "hw.h"
 
@@ -58,6 +59,27 @@ static int openocd_impl_board_reset(hw_t *ctx);
 
 // --- Static Helper Functions ---
 static void block_until_halted(hw_openocd_pvt_t *pvt);
+
+/* Send `cmd` and the TCL terminator. A signal (the host process, e.g. QEMU,
+ * uses them) can interrupt the call; that is retried, not an error. */
+static int openocd_tcl_send(int sockfd, const char *cmd) {
+    const char TCL_TERMINATOR = '\x1a';
+    const char *parts[2] = { cmd, &TCL_TERMINATOR };
+    size_t lens[2] = { strlen(cmd), 1 };
+    for (int i = 0; i < 2; i++) {
+        size_t sent = 0;
+        while (sent < lens[i]) {
+            ssize_t n = send(sockfd, parts[i] + sent, lens[i] - sent, 0);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                perror("send");
+                return -1;
+            }
+            sent += (size_t)n;
+        }
+    }
+    return 0;
+}
 
 static void block_until_halted(hw_openocd_pvt_t *pvt) {
     if (!pvt || pvt->sockfd < 0) return;
@@ -110,8 +132,7 @@ static int openocd_tcl_exec(int sockfd, const char* cmd, char* response_buf, siz
     const char TCL_TERMINATOR = '\x1a';
 
     // Send the command followed by the TCL terminator.
-    if (send(sockfd, cmd, strlen(cmd), 0) < 0 || send(sockfd, &TCL_TERMINATOR, 1, 0) < 0) {
-        perror("send");
+    if (openocd_tcl_send(sockfd, cmd) != 0) {
         return -1;
     }
 
@@ -122,6 +143,7 @@ static int openocd_tcl_exec(int sockfd, const char* cmd, char* response_buf, siz
     while(total_bytes_read < sizeof(temp_buf) -1) {
         ssize_t bytes_read = recv(sockfd, temp_buf + total_bytes_read, sizeof(temp_buf) - total_bytes_read - 1, 0);
         if (bytes_read < 0) {
+            if (errno == EINTR) continue;  // interrupted by a signal: read again
             perror("recv");
             return -1;
         }
@@ -454,8 +476,7 @@ static int openocd_tcl_exec_alloc(int sockfd, const char* cmd, char **response_o
     const char TCL_TERMINATOR = '\x1a';
     *response_out = NULL;
 
-    if (send(sockfd, cmd, strlen(cmd), 0) < 0 || send(sockfd, &TCL_TERMINATOR, 1, 0) < 0) {
-        perror("send");
+    if (openocd_tcl_send(sockfd, cmd) != 0) {
         return -1;
     }
 
@@ -472,7 +493,12 @@ static int openocd_tcl_exec_alloc(int sockfd, const char* cmd, char **response_o
         }
 
         ssize_t bytes_read = recv(sockfd, buf + used, cap - used - 1, 0);
-        if (bytes_read < 0) { perror("recv"); free(buf); return -1; }
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue;  // interrupted by a signal: read again
+            perror("recv");
+            free(buf);
+            return -1;
+        }
         if (bytes_read == 0) {
             fprintf(stderr, "OpenOCD connection closed.\n");
             free(buf);
